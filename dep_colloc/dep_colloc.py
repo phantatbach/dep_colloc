@@ -7,40 +7,71 @@ from tqdm import tqdm
 from dep_colloc.utils import build_graph
 
 # Saving the dataframe can be very time and resource consuming
+def reformat_deprel(label: str) -> str:
+    # Bỏ 'chi_' hoặc 'pa_' nếu có
+    return label.removeprefix('chi_').removeprefix('pa_')
+
 def process_file_for_syn(args):
     filename, corpus_dir, max_depth, pattern = args
     path = os.path.join(corpus_dir, filename)
     colloc = Counter()
 
     with open(path, encoding='utf-8') as f:
-        tokens = []
+        sent_toks = []
         for line in f:
             line = line.strip()
             if line.startswith('<s'):
-                tokens = []
+                sent_toks = []
                 continue
+
             if line.startswith('</s>'):
-                id2lp, graph, id2deprel = build_graph(tokens, pattern)
-                for sid, tgt in id2lp.items():
+                # 1) Build graph-level data
+                id2lemma_pos, graph, id2deprel = build_graph(sent_toks, pattern)
+
+                # 2) BFS qua mỗi token làm target
+                for sid, tgt in id2lemma_pos.items():
                     seen = {sid}
                     queue = deque([(sid, 0)])
                     while queue:
                         curr, depth = queue.popleft()
                         if depth >= max_depth:
                             continue
-                        for nb in graph.get(curr, []):
-                            if nb in seen:
+                        for nid in graph.get(curr, []):
+                            if nid in seen:
                                 continue
-                            seen.add(nb)
-                            rel = id2deprel.get((nb, curr)) or id2deprel.get((curr, nb))
-                            ctx = id2lp[nb].split('/')[0]
-                            colloc[(tgt, f"{ctx}/{rel}")] += 1
-                            queue.append((nb, depth + 1))
-                tokens = []
+                            seen.add(nid)
+
+                            # Lấy raw_label ('chi_…' hoặc 'pa_…') 
+                            raw_label = next(
+                                (lbl for (h,d), lbl in id2deprel.items() if d == nid),
+                                None
+                            ) or 'UNK'
+
+                            if raw_label.startswith('chi_'):
+                                # Child→dep: strip chi_
+                                deprel = reformat_deprel(raw_label)
+                            else:
+                                # Dep→child (pa_…): parse lại dòng gốc
+                                orig_line = sent_toks[int(nid)-1]
+                                m = pattern.match(orig_line)
+                                raw_field = m.group(6) if m else 'UNK'
+                                deprel = reformat_deprel(raw_field)
+
+                            lemma_nb = id2lemma_pos[nid].split('/')[0]
+                            filler = f"{lemma_nb}/{deprel}"
+
+                            colloc[(tgt, filler)] += 1
+                            queue.append((nid, depth + 1))
+
+                sent_toks = []
                 continue
+
             if line:
-                tokens.append(line)
+                sent_toks.append(line)
+
     return colloc
+
+
 
 def generate_syn_colloc_df(corpus_dir, output_dir,max_depth, pattern, num_workers=None):
     """
@@ -99,8 +130,8 @@ def process_file_for_path(args):
             if line.startswith('<s'):
                 sent = []
             elif line.startswith('</s>'):
-                id2lp, graph, _ = build_graph(sent, pattern)
-                for idx, tok in id2lp.items():
+                id2lemma_pos, graph, _ = build_graph(sent, pattern)
+                for idx, tok in id2lemma_pos.items():
                     seen = set()
                     queue = deque([(idx, 0)])
                     while queue:
@@ -108,12 +139,12 @@ def process_file_for_path(args):
                         if curr in seen or d > max_depth:
                             continue
                         seen.add(curr)
-                        if d > 0 and curr in id2lp:
-                            pair = tuple(sorted((tok, id2lp[curr])))
+                        if d > 0 and curr in id2lemma_pos:
+                            pair = tuple(sorted((tok, id2lemma_pos[curr])))
                             counts[pair] += 1
                         for nb in graph.get(curr, []):
                             queue.append((nb, d+1))
-                vocab.update(id2lp.values())
+                vocab.update(id2lemma_pos.values())
             elif line:
                 sent.append(line)
 
